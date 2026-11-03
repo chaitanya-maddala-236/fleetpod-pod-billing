@@ -23,14 +23,23 @@ from pydantic import BaseModel, Field, field_validator
 from PIL import Image, ImageDraw, ImageFont
 from starlette.middleware.sessions import SessionMiddleware
 from dotenv import load_dotenv
+import psycopg
 
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
-DATA_DIR = ROOT / "data"
+
+
+def configured_path(variable: str, default: Path) -> Path:
+    value = Path(os.getenv(variable, str(default))).expanduser()
+    return value if value.is_absolute() else ROOT / value
+
+
+DATA_DIR = configured_path("DATA_DIR", ROOT / "data")
 UPLOAD_DIR = DATA_DIR / "uploads"
 STATIC_DIR = ROOT / "static"
-DATABASE_PATH = Path(os.getenv("DATABASE_PATH", str(DATA_DIR / "fleetpod.db")))
+DATABASE_PATH = configured_path("DATABASE_PATH", DATA_DIR / "fleetpod.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_POD_BYTES = 300_000
@@ -52,7 +61,47 @@ class ClosingConnection(sqlite3.Connection):
             self.close()
 
 
-def connect() -> sqlite3.Connection:
+class HybridRow(dict):
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return tuple(self.values())[key]
+        return super().__getitem__(key)
+
+
+def hybrid_row(cursor):
+    columns = [column.name for column in cursor.description]
+    return lambda values: HybridRow(zip(columns, values))
+
+
+class PostgresConnection:
+    def __init__(self, database_url: str):
+        self.connection = psycopg.connect(database_url, row_factory=hybrid_row)
+
+    def execute(self, query: str, parameters=()):
+        return self.connection.execute(query.replace("?", "%s"), parameters)
+
+    def executescript(self, script: str) -> None:
+        for statement in script.split(";"):
+            if statement.strip():
+                self.execute(statement)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            if exc_type is None:
+                self.connection.commit()
+            else:
+                self.connection.rollback()
+        finally:
+            self.connection.close()
+        return False
+
+
+def connect() -> sqlite3.Connection | PostgresConnection:
+    if DATABASE_URL:
+        return PostgresConnection(DATABASE_URL)
     connection = sqlite3.connect(DATABASE_PATH, timeout=10, factory=ClosingConnection)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
@@ -105,57 +154,123 @@ def _make_demo_pod(filename: str, lr: str, consignee: str, issue: str | None = N
 
 def initialize_database() -> None:
     with connect() as db:
-        db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY,
-                email TEXT NOT NULL UNIQUE,
-                name TEXT NOT NULL,
-                role TEXT NOT NULL CHECK (role IN ('driver', 'billing')),
-                password_salt TEXT NOT NULL,
-                password_hash TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS trips (
-                id TEXT PRIMARY KEY,
-                client TEXT NOT NULL,
-                vehicle TEXT NOT NULL,
-                destination TEXT NOT NULL,
-                branch TEXT NOT NULL,
-                freight INTEGER NOT NULL CHECK (freight >= 0),
-                lr_number TEXT NOT NULL,
-                eway_bill TEXT NOT NULL,
-                expected_qty TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL CHECK (status IN ('missing', 'uploaded', 'verified', 'retake_requested', 'needs_review')),
-                remarks TEXT NOT NULL DEFAULT '',
-                delivered_at TEXT,
-                pod_at TEXT,
-                invoice_at TEXT,
-                retake_count INTEGER NOT NULL DEFAULT 0,
-                pod_image TEXT,
-                ai_result TEXT,
-                share_token TEXT NOT NULL UNIQUE,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                actor_email TEXT NOT NULL,
-                action TEXT NOT NULL,
-                trip_id TEXT,
-                detail TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(trip_id) REFERENCES trips(id)
-            );
-            CREATE TABLE IF NOT EXISTS upload_links (
-                token TEXT PRIMARY KEY,
-                trip_id TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
-                used_at TEXT,
-                FOREIGN KEY(trip_id) REFERENCES trips(id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_trips_status ON trips(status);
-            CREATE INDEX IF NOT EXISTS idx_trips_delivered ON trips(delivered_at);
-            """
-        )
+        if DATABASE_URL:
+            db.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    email TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK (role IN ('driver', 'billing')),
+                    password_salt TEXT NOT NULL,
+                    password_hash TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS trips (
+                    id TEXT PRIMARY KEY,
+                    client TEXT NOT NULL,
+                    vehicle TEXT NOT NULL,
+                    destination TEXT NOT NULL,
+                    branch TEXT NOT NULL,
+                    freight INTEGER NOT NULL CHECK (freight >= 0),
+                    lr_number TEXT NOT NULL,
+                    eway_bill TEXT NOT NULL,
+                    expected_qty TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL CHECK (status IN ('missing', 'uploaded', 'verified', 'retake_requested', 'needs_review')),
+                    remarks TEXT NOT NULL DEFAULT '',
+                    delivered_at TEXT,
+                    pod_at TEXT,
+                    invoice_at TEXT,
+                    retake_count INTEGER NOT NULL DEFAULT 0,
+                    pod_image TEXT,
+                    pod_image_data BYTEA,
+                    ai_result TEXT,
+                    share_token TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    actor_email TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    trip_id TEXT,
+                    detail TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(trip_id) REFERENCES trips(id)
+                );
+                CREATE TABLE IF NOT EXISTS upload_links (
+                    token TEXT PRIMARY KEY,
+                    trip_id TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    used_at TEXT,
+                    FOREIGN KEY(trip_id) REFERENCES trips(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_trips_status ON trips(status);
+                CREATE INDEX IF NOT EXISTS idx_trips_delivered ON trips(delivered_at);
+                ALTER TABLE trips ADD COLUMN IF NOT EXISTS pod_image_data BYTEA;
+                """
+            )
+        else:
+            db.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY,
+                    email TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK (role IN ('driver', 'billing')),
+                    password_salt TEXT NOT NULL,
+                    password_hash TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS trips (
+                    id TEXT PRIMARY KEY,
+                    client TEXT NOT NULL,
+                    vehicle TEXT NOT NULL,
+                    destination TEXT NOT NULL,
+                    branch TEXT NOT NULL,
+                    freight INTEGER NOT NULL CHECK (freight >= 0),
+                    lr_number TEXT NOT NULL,
+                    eway_bill TEXT NOT NULL,
+                    expected_qty TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL CHECK (status IN ('missing', 'uploaded', 'verified', 'retake_requested', 'needs_review')),
+                    remarks TEXT NOT NULL DEFAULT '',
+                    delivered_at TEXT,
+                    pod_at TEXT,
+                    invoice_at TEXT,
+                    retake_count INTEGER NOT NULL DEFAULT 0,
+                    pod_image TEXT,
+                    pod_image_data BLOB,
+                    ai_result TEXT,
+                    share_token TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    actor_email TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    trip_id TEXT,
+                    detail TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(trip_id) REFERENCES trips(id)
+                );
+                CREATE TABLE IF NOT EXISTS upload_links (
+                    token TEXT PRIMARY KEY,
+                    trip_id TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    used_at TEXT,
+                    FOREIGN KEY(trip_id) REFERENCES trips(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_trips_status ON trips(status);
+                CREATE INDEX IF NOT EXISTS idx_trips_delivered ON trips(delivered_at);
+                """
+            )
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(trips)").fetchall()}
+            if "pod_image_data" not in columns:
+                db.execute("ALTER TABLE trips ADD COLUMN pod_image_data BLOB")
+
+        legacy_images = db.execute("SELECT id,pod_image FROM trips WHERE pod_image IS NOT NULL AND pod_image_data IS NULL").fetchall()
+        for row in legacy_images:
+            legacy_path = UPLOAD_DIR / row["pod_image"]
+            if legacy_path.is_file():
+                db.execute("UPDATE trips SET pod_image_data=? WHERE id=?", (legacy_path.read_bytes(), row["id"]))
+
         if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             users = [
                 ("driver@fleetpod.demo", "Demo Driver", "driver", "DriverDemo26!"),
@@ -195,12 +310,13 @@ def initialize_database() -> None:
                 delivered_at = now - timedelta(days=delivered_days)
                 pod_at = now - timedelta(days=pod_days) if pod_days else None
                 invoice_at = now - timedelta(days=invoiced_days) if invoiced_days else None
+                pod_image_data = (UPLOAD_DIR / pod_filename).read_bytes() if pod_filename else None
                 db.execute(
-                    """INSERT INTO trips(id,client,vehicle,destination,branch,freight,lr_number,eway_bill,expected_qty,status,remarks,delivered_at,pod_at,invoice_at,retake_count,pod_image,ai_result,share_token,created_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    """INSERT INTO trips(id,client,vehicle,destination,branch,freight,lr_number,eway_bill,expected_qty,status,remarks,delivered_at,pod_at,invoice_at,retake_count,pod_image,pod_image_data,ai_result,share_token,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (trip_id, client, vehicle, destination, branch, freight, lr, eway, qty, status, remarks,
                      iso(delivered_at), iso(pod_at), iso(invoice_at), 1 if status == "retake_requested" else 0,
-                     pod_filename, ai_result, secrets.token_urlsafe(24), iso(now)),
+                     pod_filename, pod_image_data, ai_result, secrets.token_urlsafe(24), iso(now)),
                 )
 
 
@@ -289,6 +405,7 @@ def log_action(db: sqlite3.Connection, user: dict[str, Any], action: str, trip_i
 
 def trip_json(row: sqlite3.Row) -> dict[str, Any]:
     result = dict(row)
+    result.pop("pod_image_data", None)
     result["pod_url"] = f"/api/pods/{row['id']}/image" if row["pod_image"] else None
     result["ai_result"] = json.loads(row["ai_result"]) if row["ai_result"] else None
     result["share_url"] = f"/share/{row['share_token']}"
@@ -474,22 +591,32 @@ def upload_page(token: str) -> FileResponse:
 
 
 @app.get("/api/pods/{trip_id}/image")
-def private_pod_image(trip_id: str, user: dict[str, Any] = Depends(current_user)) -> FileResponse:
+def private_pod_image(trip_id: str, user: dict[str, Any] = Depends(current_user)) -> Response:
     with connect() as db:
-        trip = get_trip(db, trip_id)
-        filename = trip["pod_image"]
-    if not filename:
+        trip = db.execute("SELECT pod_image,pod_image_data FROM trips WHERE id=?", (trip_id,)).fetchone()
+    if not trip or not trip["pod_image"]:
         raise HTTPException(status_code=404, detail="POD image is not available")
-    return FileResponse(UPLOAD_DIR / filename, media_type="image/jpeg", headers={"Cache-Control": "private, no-store"})
+    image_data = trip["pod_image_data"]
+    if image_data:
+        return Response(content=image_data, media_type="image/jpeg", headers={"Cache-Control": "private, no-store"})
+    legacy_path = UPLOAD_DIR / trip["pod_image"]
+    if legacy_path.is_file():
+        return FileResponse(legacy_path, media_type="image/jpeg", headers={"Cache-Control": "private, no-store"})
+    raise HTTPException(status_code=404, detail="POD image is not available")
 
 
 @app.get("/api/share/{token}/image")
-def shared_pod_image(token: str) -> FileResponse:
+def shared_pod_image(token: str) -> Response:
     with connect() as db:
-        row = db.execute("SELECT pod_image FROM trips WHERE share_token=?", (token,)).fetchone()
+        row = db.execute("SELECT pod_image,pod_image_data FROM trips WHERE share_token=?", (token,)).fetchone()
     if not row or not row["pod_image"]:
         raise HTTPException(status_code=404, detail="POD image is not available")
-    return FileResponse(UPLOAD_DIR / row["pod_image"], media_type="image/jpeg", headers={"Cache-Control": "private, no-store"})
+    if row["pod_image_data"]:
+        return Response(content=row["pod_image_data"], media_type="image/jpeg", headers={"Cache-Control": "private, no-store"})
+    legacy_path = UPLOAD_DIR / row["pod_image"]
+    if legacy_path.is_file():
+        return FileResponse(legacy_path, media_type="image/jpeg", headers={"Cache-Control": "private, no-store"})
+    raise HTTPException(status_code=404, detail="POD image is not available")
 
 
 @app.get("/api/health")
@@ -551,9 +678,7 @@ async def upload_pod(
         retake_count = trip["retake_count"] + (1 if trip["status"] == "retake_requested" else 0)
         trip_context = dict(trip)
         filename = f"{trip_id.lower()}-{secrets.token_hex(8)}.jpg"
-        image_path = UPLOAD_DIR / filename
-        image_path.write_bytes(image_bytes)
-        db.execute("UPDATE trips SET status='uploaded',pod_image=?,pod_at=?,remarks=?,ai_result=NULL WHERE id=?", (filename, iso(captured_at), "AI check in progress", trip_id))
+        db.execute("UPDATE trips SET status='uploaded',pod_image=?,pod_image_data=?,pod_at=?,remarks=?,ai_result=NULL WHERE id=?", (filename, image_bytes, iso(captured_at), "AI check in progress", trip_id))
         log_action(db, user, "pod_uploaded", trip_id, f"Captured {payload.captured_at}; GPS {payload.latitude},{payload.longitude}")
     status, reason, result = await evaluate_pod(image_bytes, mime_type, trip_context, retake_count)
     with connect() as db:
@@ -722,9 +847,8 @@ async def upload_via_link(token: str, payload: PodInput) -> dict[str, Any]:
         retake_count = trip["retake_count"] + (1 if trip["status"] == "retake_requested" else 0)
         db.execute("UPDATE upload_links SET used_at=? WHERE token=?", (iso(utc_now()), token))
     filename = f"{trip_id.lower()}-{secrets.token_hex(8)}.jpg"
-    (UPLOAD_DIR / filename).write_bytes(image_bytes)
     with connect() as db:
-        db.execute("UPDATE trips SET status='uploaded',pod_image=?,pod_at=?,remarks='AI check in progress',ai_result=NULL WHERE id=?", (filename, iso(captured_at), trip_id))
+        db.execute("UPDATE trips SET status='uploaded',pod_image=?,pod_image_data=?,pod_at=?,remarks='AI check in progress',ai_result=NULL WHERE id=?", (filename, image_bytes, iso(captured_at), trip_id))
     status, reason, result = await evaluate_pod(image_bytes, mime_type, trip_context, retake_count)
     if status == "retake_requested":
         status, reason = "needs_review", "Hired-driver uploads go to a billing executive for any retake decision"

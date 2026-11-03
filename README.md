@@ -23,7 +23,7 @@ FleetPOD is a small proof-of-delivery and billing workflow for Company A's road 
 
 6. Open <http://127.0.0.1:8000>.
 
-Demo accounts are documented in [deployment.md](deployment.md). The SQLite database and generated demo POD images are created under `data/` on first run.
+Demo accounts are documented in [deployment.md](deployment.md). Locally, SQLite and generated demo POD images are created under `data/` on first run. Set `DATABASE_URL` to use PostgreSQL; the Render Blueprint stores hosted POD images in PostgreSQL so they persist on the free web service.
 
 ## Demo flow
 
@@ -36,6 +36,10 @@ Demo accounts are documented in [deployment.md](deployment.md). The SQLite datab
 
 See [Technical Design Document.pdf](Technical%20Design%20Document.pdf) and [deployment.md](deployment.md). The app uses FastAPI, SQLite, secure signed session cookies, a static responsive frontend, IndexedDB for offline photo submissions, and the OpenAI Responses API for optional vision checks.
 
+## Render deployment
+
+The repository includes a Render Blueprint in [render.yaml](render.yaml). Push the repository to GitHub, create a free Render Blueprint from it, and follow the steps in [deployment.md](deployment.md). The hosted app uses Neon PostgreSQL to retain trips and uploaded POD images across Render restarts; local development defaults to SQLite.
+
 ## Test
 
 ```powershell
@@ -44,7 +48,7 @@ pytest -q
 
 ## Current limits
 
-- No production deployment or public GitHub repository is configured in this workspace.
+- No live deployment is configured yet. Public source: <https://github.com/chaitanya-maddala-236/fleetpod-pod-billing>.
 - SMS and Tally are mocked: the app creates copyable one-time upload links and a CSV export, but sends no messages and makes no external accounting-system calls.
 - AI errors or missing credentials never produce a verified result. A billing executive must review the image and correct extracted values.
 - The generated POD images and trip records are synthetic examples. Do not add real consignee personal data to this demo.
