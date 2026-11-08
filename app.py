@@ -71,7 +71,8 @@ class HybridRow(dict):
 
 
 def hybrid_row(cursor):
-    columns = [column.name for column in cursor.description]
+    # DDL and other non-row statements have no cursor description.
+    columns = [column.name for column in (cursor.description or ())]
     return lambda values: HybridRow(zip(columns, values))
 
 
@@ -325,8 +326,8 @@ def initialize_database() -> None:
 try:
     initialize_database()
 except Exception as exc:
-    # Do not log DATABASE_URL or exception text, which can contain connection details.
-    logger.exception(
+    # Exception messages can contain database connection details; log the class only.
+    logger.error(
         "FleetPOD database initialization failed (%s); DATABASE_URL configured=%s",
         type(exc).__name__,
         bool(DATABASE_URL),
