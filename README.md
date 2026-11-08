@@ -4,7 +4,7 @@ FleetPOD is a small proof-of-delivery and billing workflow for Company A's road 
 
 ## Run locally
 
-1. Use Python 3.11 or newer.
+1. Use Python 3.13 or newer.
 2. Open a terminal in this directory.
 3. Create a virtual environment and install dependencies:
 
@@ -36,9 +36,9 @@ Demo accounts are documented in [deployment.md](deployment.md). Locally, SQLite 
 
 See [Technical Design Document.pdf](Technical%20Design%20Document.pdf) and [deployment.md](deployment.md). The app uses FastAPI, SQLite, secure signed session cookies, a static responsive frontend, IndexedDB for offline photo submissions, and the OpenAI Responses API for optional vision checks.
 
-## Render deployment
+## Live demo and deployment
 
-The repository includes a Render Blueprint in [render.yaml](render.yaml). Push the repository to GitHub, create a free Render Blueprint from it, and follow the steps in [deployment.md](deployment.md). The hosted app uses Neon PostgreSQL to retain trips and uploaded POD images across Render restarts; local development defaults to SQLite.
+Live app: <https://fleetpod.onrender.com>. The free Render web service uses Neon PostgreSQL to retain trips and uploaded POD images across Render restarts; local development defaults to SQLite. The repository includes a Render Blueprint in [render.yaml](render.yaml). See [deployment.md](deployment.md) for demo credentials and setup steps.
 
 ## Test
 
@@ -48,7 +48,8 @@ pytest -q
 
 ## Current limits
 
-- No live deployment is configured yet. Public source: <https://github.com/chaitanya-maddala-236/fleetpod-pod-billing>.
+- Public source: <https://github.com/chaitanya-maddala-236/fleetpod-pod-billing>.
+- The public demo has no paid vision API credential configured. Its upload flow safely routes to human review; set `OPENAI_API_KEY` in a private deployment to enable vision extraction.
 - SMS and Tally are mocked: the app creates copyable one-time upload links and a CSV export, but sends no messages and makes no external accounting-system calls.
 - AI errors or missing credentials never produce a verified result. A billing executive must review the image and correct extracted values.
 - The generated POD images and trip records are synthetic examples. Do not add real consignee personal data to this demo.
