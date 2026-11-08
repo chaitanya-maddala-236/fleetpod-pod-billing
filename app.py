@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import io
 import json
+import logging
 import os
 import re
 import secrets
@@ -43,6 +44,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_POD_BYTES = 300_000
+logger = logging.getLogger("fleetpod")
 
 
 def utc_now() -> datetime:
@@ -320,7 +322,16 @@ def initialize_database() -> None:
                 )
 
 
-initialize_database()
+try:
+    initialize_database()
+except Exception as exc:
+    # Do not log DATABASE_URL or exception text, which can contain connection details.
+    logger.exception(
+        "FleetPOD database initialization failed (%s); DATABASE_URL configured=%s",
+        type(exc).__name__,
+        bool(DATABASE_URL),
+    )
+    raise
 
 app = FastAPI(title="FleetPOD", version="1.0.0")
 session_secret = os.getenv("SESSION_SECRET") or secrets.token_urlsafe(48)
